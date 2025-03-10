@@ -1,9 +1,9 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -e
 
 # Set verbosity
-if [ "${DEBUG}" = 1 ]; then
+if [ "${DEBUG}" = true ]; then
 	set -x
 	KUBEADM_VERBOSE="-v=8"
 else
@@ -17,10 +17,10 @@ COMMAND=$1
 
 # Define global compatibility matrix
 declare -A versions=(
-	["containerd"]="v1.7.16"
-	["runc"]="v1.1.11"
-	["cni"]="v1.4.0"
-	["crictl"]="v1.29.0"
+	["containerd"]="v2.0.2"
+	["runc"]="v1.2.5"
+	["cni"]="v1.6.2"
+	["crictl"]="v1.32.0"
 )
 
 # Helper function to display usage information
@@ -28,9 +28,9 @@ helper() {
 	cat <<EOF
 Usage:
 
-  ENV=... yaki <init|join|reset|help>
+  ENV=... yaki <download|init|join|reset|help>
     or
-  curl -sfL https://goyaki.clastix.io | ENV=... bash -s <init|join|reset|help>
+  curl -sfL https://raw.githubusercontent.com/AGou-ops/k8s-kubeadm-onekey/refs/heads/master/yaki | ENV=... bash -s <init|join|reset|help>
 
   You must be sudo to run this script.
 
@@ -39,24 +39,29 @@ Commands:
   init: Deploy the first control-plane node of the Kubernetes cluster
     - This command initializes the Kubernetes control-plane on the first node.
     - Requires: JOIN_URL (optional), KUBEADM_CONFIG (optional), ADVERTISE_ADDRESS(optional), BIND_PORT (optional), KUBERNETES_VERSION (optional)
-    - Example: KUBERNETES_VERSION=v1.30.2 yaki init
-    - Example: JOIN_URL=<control-plane-endpoint>:<port> KUBERNETES_VERSION=v1.30.2 yaki init
+    - Example: KUBERNETES_VERSION=v1.30.5 yaki init
+    - Example: JOIN_URL=<control-plane-endpoint>:<port> KUBERNETES_VERSION=v1.30.5 yaki init
     - Example: KUBEADM_CONFIG=kubeadm-config.yaml yaki init
 
   join: Join a control plane node to the cluster
     - This command joins the node as control plane to an existing Kubernetes cluster.
     - It also installs all necessary prerequisites, container runtime, CNI plugins, and Kubernetes binaries.
-    - Requires: JOIN_URL, JOIN_TOKEN, JOIN_TOKEN_CACERT_HASH, JOIN_ASCP, KUBERNETES_VERSION (optional)
-    - Example: JOIN_URL=<control-plane-endpoint>:<port> JOIN_TOKEN=<token> JOIN_TOKEN_CERT_KEY=<key> JOIN_TOKEN_CACERT_HASH=sha256:<hash> JOIN_ASCP=1 KUBERNETES_VERSION=v1.30.2 yaki join
+    - Requires: JOIN_URL, JOIN_TOKEN, JOIN_TOKEN_CACERT_HASH (optional), JOIN_ASCP, KUBERNETES_VERSION (optional)
+    - If JOIN_TOKEN_CACERT_HASH is provided, it will be used for secure join.
+    - If JOIN_TOKEN_CACERT_HASH is not provided, it will join using --discovery-token-unsafe-skip-ca-verification.
+    - Example: JOIN_URL=<control-plane-endpoint>:<port> JOIN_TOKEN=<token> JOIN_TOKEN_CERT_KEY=<key> JOIN_TOKEN_CACERT_HASH=sha256:<hash> JOIN_ASCP=true KUBERNETES_VERSION=v1.30.5 yaki join
 
   join: Join a node to the cluster
     - This command joins the node to an existing Kubernetes cluster.
-    - Requires: JOIN_URL, JOIN_TOKEN, JOIN_TOKEN_CACERT_HASH, KUBERNETES_VERSION (optional)
-    - Example: JOIN_URL=<control-plane-endpoint>:<port> JOIN_TOKEN=<token> JOIN_TOKEN_CACERT_HASH=sha256:<hash> KUBERNETES_VERSION=v1.30.2 yaki join
+    - Requires: JOIN_URL, JOIN_TOKEN, JOIN_TOKEN_CACERT_HASH (optional), KUBERNETES_VERSION (optional)
+    - If JOIN_TOKEN_CACERT_HASH is provided, it will be used for secure join.
+    - If JOIN_TOKEN_CACERT_HASH is not provided, it will join using --discovery-token-unsafe-skip-ca-verification.
+    - Example: JOIN_URL=<control-plane-endpoint>:<port> JOIN_TOKEN=<token> JOIN_TOKEN_CACERT_HASH=sha256:<hash> KUBERNETES_VERSION=v1.30.5 yaki join
 
   reset: Reset the node
     - This command removes all Kubernetes components and configurations from the node.
     - Example: yaki reset
+    - If set REBOOT=true, the machine will be rebooted after reset.
 
   help: Print this help
     - Displays this help message.
@@ -67,7 +72,7 @@ Environment variables:
   +-------------------------+-------------------------------------------------------------+------------+
   | Variable                | Description                                                 | Default    |
   +-------------------------+-------------------------------------------------------------+------------+
-  | KUBERNETES_VERSION      | Version of kubernetes to install.                           | v1.30.2    |
+  | KUBERNETES_VERSION      | Version of kubernetes to install.                           | v1.30.5    |
   | CONTAINERD_VERSION      | Version of container runtime containerd.                    | see matrix |
   | RUNC_VERSION            | Version of runc to install.                                 | see matrix |
   | CNI_VERSION             | Version of CNI plugins to install.                          | see matrix |
@@ -79,24 +84,26 @@ Environment variables:
   | JOIN_TOKEN_CACERT_HASH  | Token Certificate Authority hash to join the control-plane. | Not set    |
   | JOIN_TOKEN_CERT_KEY     | Token Certificate Key to join the control-plane.            | Not set    |
   | JOIN_URL                | URL to join the control-plane.                              | Not set    |
-  | JOIN_ASCP               | Switch to join either as control plane or worker.           | 0          |
-  | DEBUG                   | Set to 1 for more verbosity during script execution.        | 0          |
+  | JOIN_ASCP               | Switch to join either as control plane or worker.           | false      |
+  | DEBUG                   | Set to true for more verbosity during script execution.     | false      |
+  | REBOOT                  | Set to true to reboot the machine after reset.              | false      |
   +-------------------------+-------------------------------------------------------------+------------+
 
 EOF
 }
 
 # Log functions
-info() { echo "[INFO] $@"; }
-warn() { echo "[WARN] $@" >&2; }
+info() { echo "[INFO] $*"; }
+warn() { echo "[WARN] $*" >&2; }
 fatal() {
-	echo "[ERROR] $@" >&2
+	echo "[ERROR] $*" >&2
 	exit 1
 }
 
 # Setup architecture
 setup_arch() {
-	case ${ARCH:=$(uname -m)} in
+	# case ${ARCH:=$(uname -m)} in
+	case "amd64" in
 	amd64 | x86_64) ARCH=amd64 ;;
 	arm64) ARCH=arm64 ;;
 	*) fatal "unsupported architecture ${ARCH}" ;;
@@ -114,13 +121,16 @@ setup_env() {
 	# Check if running as root
 	[ "$(id -u)" -eq 0 ] || fatal "You need to be root to perform this install"
 	# Set default values
-	KUBERNETES_VERSION=${KUBERNETES_VERSION:-v1.30.2}
+	KUBERNETES_VERSION=${KUBERNETES_VERSION:-v1.30.5}
+	JOIN_ASCP=${JOIN_ASCP:-false}
 	CONTAINERD_VERSION=${CONTAINERD_VERSION:-$(get_version "containerd")}
 	RUNC_VERSION=${RUNC_VERSION:-$(get_version "runc")}
 	CNI_VERSION=${CNI_VERSION:-$(get_version "cni")}
 	CRICTL_VERSION=${CRICTL_VERSION:-$(get_version "crictl")}
 	ADVERTISE_ADDRESS=${ADVERTISE_ADDRESS:-0.0.0.0}
 	BIND_PORT=${BIND_PORT:-6443}
+	REBOOT=${REBOOT:-false}
+	DEBUG=${DEBUG:-false}
 }
 
 # Check if prerequisites are installed
@@ -189,9 +199,12 @@ load_containerd_images() {
 # Configure system settings
 configure_system_settings() {
 	info "Configure system settings: "
+
 	info "  - disable swap"
 	swapoff -a
-	sed -i '/ swap / s/^/#/' /etc/fstab
+
+	info "  - swap entry process in /etc/fstab"
+	sed -i '/^[^#].*\sswap\s/s/^/#/' /etc/fstab
 
 	info "  - enable required kernel modules"
 	cat <<EOF | tee /etc/modules-load.d/k8s.conf
@@ -207,6 +220,7 @@ net.bridge.bridge-nf-call-iptables  = 1
 net.bridge.bridge-nf-call-ip6tables = 1
 net.ipv4.ip_forward                 = 1
 EOF
+
 	info "  - apply sysctl settings"
 	sysctl --system
 }
@@ -324,11 +338,16 @@ join_node() {
 	[ -z "${JOIN_TOKEN_CACERT_HASH}" ] && fatal "JOIN_TOKEN_CACERT_HASH is not set"
 
 	info "Joining the node to the cluster"
-	# Construct the initial kubeadm join arguments
-	local KUBEADM_ARGS="${JOIN_URL} --token ${JOIN_TOKEN} --discovery-token-ca-cert-hash ${JOIN_TOKEN_CACERT_HASH}"
+
+	# Check if JOIN_TOKEN_CACERT_HASH is provided and not empty
+	if [ -n "${JOIN_TOKEN_CACERT_HASH}" ]; then
+		local KUBEADM_ARGS="${JOIN_URL} --token ${JOIN_TOKEN} --discovery-token-ca-cert-hash ${JOIN_TOKEN_CACERT_HASH}"
+	else
+		local KUBEADM_ARGS="${JOIN_URL} --token ${JOIN_TOKEN} --discovery-token-unsafe-skip-ca-verification"
+	fi
 
 	# If the node is joining as control plane, add control plane specific arguments
-	if [ "${JOIN_ASCP}" ]; then
+	if [ "${JOIN_ASCP}" = true ]; then
 		# Check if JOIN_TOKEN_CERT_KEY is set, if not, terminate with an error message
 		[ -z "${JOIN_TOKEN_CERT_KEY}" ] && fatal "JOIN_TOKEN_CERT_KEY is not set for control plane join"
 		# Append control plane specific arguments to KUBEADM_ARGS
@@ -379,8 +398,8 @@ clean_iptables() {
 
 # Reboot the machine
 reboot_machine() {
-	info "Rebooting the machine now..."
-	systemctl reboot
+	info "Rebooting the machine in 1 minute..."
+	shutdown -r +1 "System will reboot in 1 minute"
 }
 
 # Main commands
@@ -392,7 +411,7 @@ do_kube_setup() {
 	install_containerd
 	install_crictl
 	install_kube_binaries
-	load_containerd_images
+	# load_containerd_images
 }
 
 do_pre_download() {
@@ -419,7 +438,11 @@ do_reset() {
 	remove_containerd
 	remove_binaries
 	clean_iptables
-	# reboot_machine
+	if [ "${REBOOT}" = true ]; then
+		reboot_machine
+	fi
+	info "Reset completed successfully"
+	exit 0
 }
 
 # Main script execution
